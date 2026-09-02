@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{{ report.company_name }} — Credit Assessment</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm; }
+  body { font-family: Arial, Helvetica, sans-serif; font-size: 10.5pt; color: #1a1a1a; margin: 0; }
+  h1 { font-size: 17pt; margin: 0 0 2px 0; }
+  h2 { font-size: 12.5pt; margin: 18px 0 6px 0; color: #4b1d6e; border-bottom: 2px solid #4b1d6e; padding-bottom: 3px; }
+  .meta { color: #555; font-size: 9pt; margin-bottom: 10px; }
+  .badges { margin: 6px 0 14px 0; }
+  .badge { display: inline-block; border: 1px solid #999; border-radius: 3px; padding: 2px 8px; margin-right: 6px; font-size: 8.5pt; color: #333; }
+  .rec-banner { padding: 10px 14px; border-radius: 4px; margin-bottom: 14px; }
+  .rec-recommended { background: #e6f4ea; border: 1px solid #2e7d32; }
+  .rec-conditions { background: #fff8e1; border: 1px solid #b28704; }
+  .rec-not { background: #fdecea; border: 1px solid #c62828; }
+  .rec-title { font-weight: bold; font-size: 12pt; }
+
+  table { width: 100%; border-collapse: collapse; margin-bottom: 10px; }
+  th, td { text-align: left; padding: 5px 7px; border: 1px solid #ddd; font-size: 9.5pt; vertical-align: top; }
+  th { background: #f2eef7; color: #4b1d6e; }
+
+  .score-band td { text-align: center; }
+  .score-big { font-size: 22pt; font-weight: bold; color: #4b1d6e; }
+  .score-label { font-size: 8pt; color: #666; text-transform: uppercase; }
+  .score-sub { font-size: 8pt; color: #888; }
+
+  .grounding-grounded { color: #2e7d32; font-weight: bold; }
+  .grounding-inferred { color: #b28704; font-weight: bold; }
+  .grounding-unavailable { color: #999; font-style: italic; }
+
+  .summary-block { background: #fafafa; border-left: 3px solid #4b1d6e; padding: 8px 10px; margin-bottom: 10px; font-size: 9.7pt; }
+  .issues-list { font-size: 8.7pt; color: #555; }
+  .issues-list li { margin-bottom: 3px; }
+  .disclaimer { margin-top: 20px; padding-top: 8px; border-top: 1px solid #ccc; font-size: 7.8pt; color: #777; }
+  .source-note { font-size: 8.3pt; color: #777; margin-top: -4px; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+
+<h1>{{ report.company_name }} — Credit Assessment</h1>
+<div class="meta">
+  Generated {{ report.generated_at }}
+  {% if report.ticker %} · Ticker: {{ report.ticker }}{% endif %}
+  {% if not report.has_ticker %} · Private / unlisted (no exchange ticker){% endif %}
+</div>
+<div class="badges">
+  {% if report.is_bank %}<span class="badge">Bank — {{ report.bank_category }}</span>{% else %}<span class="badge">Non-bank</span>{% endif %}
+  <span class="badge">{{ report.scores.agents_averaged }} agents scored</span>
+</div>
+
+<div class="rec-banner {% if report.recommendation == 'Recommended' %}rec-recommended{% elif report.recommendation == 'Recommended with Conditions' %}rec-conditions{% else %}rec-not{% endif %}">
+  <span class="rec-title">{{ report.recommendation }}</span> — {{ report.recommendation_note }}
+</div>
+
+<h2>Score Summary</h2>
+<table class="score-band">
+  <tr>
+    <th>Final Score</th>
+    <th>Finance</th>
+    <th>Hygiene</th>
+    <th>Business &amp; Mgmt</th>
+    {% if report.scores.banking %}<th>Banking</th>{% endif %}
+  </tr>
+  <tr>
+    <td><span class="score-big">{{ report.scores.final_score }}</span><br><span class="score-label">/ 100</span></td>
+    <td><span class="score-big">{{ report.scores.finance.shrunk_score }}</span><br><span class="score-sub">raw {{ report.scores.finance.raw_score }} · {{ (report.scores.finance.completeness_ratio * 100) | round | int }}% complete</span></td>
+    <td><span class="score-big">{{ report.scores.hygiene.shrunk_score }}</span><br><span class="score-sub">raw {{ report.scores.hygiene.raw_score }} · {{ (report.scores.hygiene.completeness_ratio * 100) | round | int }}% complete</span></td>
+    <td><span class="score-big">{{ report.scores.business.shrunk_score }}</span><br><span class="score-sub">raw {{ report.scores.business.raw_score }} · {{ (report.scores.business.completeness_ratio * 100) | round | int }}% complete</span></td>
+    {% if report.scores.banking %}
+    <td><span class="score-big">{{ report.scores.banking.shrunk_score }}</span><br><span class="score-sub">raw {{ report.scores.banking.raw_score }} · {{ (report.scores.banking.completeness_ratio * 100) | round | int }}% complete</span></td>
+    {% endif %}
+  </tr>
+</table>
+<div class="source-note">Scores are pulled toward a neutral 50 baseline in proportion to how much of each agent's assessment was actually sourced (completeness) — a confident-looking score built on thin evidence lands near 50, not at its raw extreme.</div>
+
+<h2>Finance</h2>
+<div class="summary-block">{{ report.finance_result.summary }}</div>
+{% if report.finance_result.data_path == 'ticker' and report.finance_result.market_metrics %}
+{% set m = report.finance_result.market_metrics %}
+<table>
+  <tr><th>Price</th><td>{{ m.current_price_formatted or 'unavailable' }}</td><th>Market Cap</th><td>{{ m.market_cap_formatted or 'unavailable' }}</td></tr>
+  <tr><th>P/E (TTM)</th><td>{{ m.pe_ratio_formatted or 'unavailable' }}</td><th>ROE</th><td>{{ m.roe_formatted or 'unavailable' }}</td></tr>
+  <tr><th>Debt/Equity</th><td>{{ m.debt_to_equity_formatted or 'unavailable' }}</td><th>Revenue (TTM)</th><td>{{ m.revenue_ttm_formatted or 'unavailable' }}</td></tr>
+</table>
+{% if report.finance_result.six_month_outlook %}
+<h2>6-Month Outlook</h2>
+<div class="summary-block">{{ report.finance_result.six_month_outlook }}</div>
+{% endif %}
+{% elif report.finance_result.source_name %}
+<div class="source-note">Source: {{ report.finance_result.source_name }}{% if report.finance_result.source_url %} — <a href="{{ report.finance_result.source_url }}">{{ report.finance_result.source_url }}</a>{% endif %}</div>
+{% endif %}
+
+<h2>Business &amp; Management</h2>
+<table>
+  <tr><th>Dimension</th><th>Assessment</th><th>Grounding</th></tr>
+  <tr>
+    <td>Promoter &amp; Management Pedigree</td>
+    <td>{{ report.business_result.promoter_management_pedigree.assessment }}</td>
+    <td class="grounding-{{ report.business_result.promoter_management_pedigree.grounding }}">{{ report.business_result.promoter_management_pedigree.grounding }}</td>
+  </tr>
+  <tr>
+    <td>Business Model &amp; Moat</td>
+    <td>{{ report.business_result.business_model_moat.assessment }}</td>
+    <td class="grounding-{{ report.business_result.business_model_moat.grounding }}">{{ report.business_result.business_model_moat.grounding }}</td>
+  </tr>
+  <tr>
+    <td>Operating Trajectory</td>
+    <td>{{ report.business_result.operating_trajectory.assessment }}</td>
+    <td class="grounding-{{ report.business_result.operating_trajectory.grounding }}">{{ report.business_result.operating_trajectory.grounding }}</td>
+  </tr>
+  <tr>
+    <td>Industry &amp; Macro Headwinds</td>
+    <td>{{ report.business_result.industry_macro_headwinds.assessment }}</td>
+    <td class="grounding-{{ report.business_result.industry_macro_headwinds.grounding }}">{{ report.business_result.industry_macro_headwinds.grounding }}</td>
+  </tr>
+</table>
+
+{% if report.is_bank and report.banking_result %}
+<h2>Banking</h2>
+<div class="summary-block">{{ report.banking_result.summary }}</div>
+<table>
+  <tr><th>Dimension</th><th>Assessment</th><th>Grounding</th></tr>
+  <tr>
+    <td>Promoter &amp; Management Pedigree</td>
+    <td>{{ report.banking_result.promoter_management_pedigree.assessment }}</td>
+    <td class="grounding-{{ report.banking_result.promoter_management_pedigree.grounding }}">{{ report.banking_result.promoter_management_pedigree.grounding }}</td>
+  </tr>
+  <tr>
+    <td>Business Model &amp; Moat</td>
+    <td>{{ report.banking_result.business_model_moat.assessment }}</td>
+    <td class="grounding-{{ report.banking_result.business_model_moat.grounding }}">{{ report.banking_result.business_model_moat.grounding }}</td>
+  </tr>
+  <tr>
+    <td>Operating Trajectory</td>
+    <td>{{ report.banking_result.operating_trajectory.assessment }}</td>
+    <td class="grounding-{{ report.banking_result.operating_trajectory.grounding }}">{{ report.banking_result.operating_trajectory.grounding }}</td>
+  </tr>
+  <tr>
+    <td>Industry &amp; Macro Headwinds</td>
+    <td>{{ report.banking_result.industry_macro_headwinds.assessment }}</td>
+    <td class="grounding-{{ report.banking_result.industry_macro_headwinds.grounding }}">{{ report.banking_result.industry_macro_headwinds.grounding }}</td>
+  </tr>
+</table>
+
+{% if report.banking_result.rbi_benchmark %}
+{% set b = report.banking_result.rbi_benchmark.benchmarks %}
+<div class="source-note">RBI peer-group benchmark for {{ report.banking_result.bank_category }} as of {{ report.banking_result.rbi_benchmark.as_of }} — source: {{ report.banking_result.rbi_benchmark.source }}. These are peer-group averages, not this bank's own reported figures.</div>
+<table>
+  <tr><th>CRAR</th><td>{{ b.crar_pct }}%</td><th>Tier 1 Capital</th><td>{{ b.tier1_capital_ratio_pct }}%</td></tr>
+  <tr><th>Gross NPA</th><td>{{ b.gross_npa_pct }}%</td><th>Net NPA</th><td>{{ b.net_npa_pct }}%</td></tr>
+  <tr><th>Leverage Ratio</th><td>{{ b.leverage_ratio_pct }}%</td><th>LCR</th><td>{{ b.liquidity_coverage_ratio_pct }}%</td></tr>
+</table>
+{% else %}
+<div class="source-note">No RBI peer-group benchmark available for category "{{ report.banking_result.bank_category }}".</div>
+{% endif %}
+{% endif %}
+
+<h2>Hygiene &amp; AML Screening</h2>
+<div class="summary-block">{{ report.hygiene_result.summary }}</div>
+<table>
+  <tr><th>Sources Checked</th><td>{{ report.hygiene_result.sources_checked }}</td><th>Sources Unavailable</th><td>{{ report.hygiene_result.sources_unavailable }}</td></tr>
+  <tr><th>High Severity</th><td>{{ report.hygiene_result.high_severity_count }}</td><th>Elevated Severity</th><td>{{ report.hygiene_result.elevated_severity_count }}</td></tr>
+  <tr><th>Watch</th><td>{{ report.hygiene_result.watch_severity_count }}</td><th>Clean</th><td>{{ report.hygiene_result.none_severity_count }}</td></tr>
+</table>
+
+{% if report.issues %}
+<h2>Data Quality Notes</h2>
+<ul class="issues-list">
+  {% for issue in report.issues %}
+  <li><strong>[{{ issue.severity }}] {{ issue.stage }}:</strong> {{ issue.message }}</li>
+  {% endfor %}
+</ul>
+{% endif %}
+
+<div class="disclaimer">{{ report.disclaimer }}</div>
+
+</body>
+</html>

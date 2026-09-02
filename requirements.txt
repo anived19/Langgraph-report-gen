@@ -1,0 +1,30 @@
+google-genai>=1.0.0
+tavily-python>=0.5.0
+yfinance>=1.5.0
+pandas>=2.0.0
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+python-dotenv>=1.0.0
+tenacity>=8.3.0
+markdown>=3.6
+Jinja2>=3.1.0
+weasyprint>=62.0
+xhtml2pdf>=0.2.16
+matplotlib>=3.9.0
+PyYAML>=6.0
+requests>=2.31.0
+httpx[http2]>=0.27.0
+beautifulsoup4>=4.12.0  # HTML parsing for tools/rating_agency_tools.py (CRISIL rationale documents)
+pypdf>=4.0.0  # RBI Scheduled Commercial Banks list PDF parsing (tools/bank_classifier.py)
+playwright>=1.40.0  # optional: browser-fallback tier for blocked AML/sanctions sources (tools/aml_tools.py). Run `playwright install chromium` once after installing. Safe to skip — its absence is caught and just disables tier 3.
+pytest>=8.0.0
+pytest-mock>=3.12.0
+
+# credit_report/ — LangGraph pipeline (separate from harness/'s hand-rolled
+# Gemini loop). LANGCHAIN_TRACING_V2 stays unset/false by default — telemetry
+# opt-out; has no effect on graph execution, only on whether an optional
+# debug trace is emitted anywhere.
+langgraph>=1.0.4
+langchain>=1.1.2
+langchain-core>=1.1.2
+langchain-google-genai>=4.0.0
