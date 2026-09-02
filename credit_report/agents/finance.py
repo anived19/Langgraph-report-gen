@@ -23,6 +23,7 @@ from credit_report.model import build_model
 from credit_report.prompt_loader import load_prompt
 from credit_report.schemas import FinanceLLMAssessment, FinanceResult
 from credit_report.tool_capture import capturing
+from credit_report.trace import build_agent_trace
 from tools.finance_tools import (
     _MARKET_METRICS_FIELD_KEYS,
     assemble_market_metrics,
@@ -135,6 +136,7 @@ def _run_no_ticker_finance(entity_name: str) -> dict[str, Any]:
             "severity": "info",
         })
 
+    agent_result: dict[str, Any] | None = None
     try:
         agent_result = agent.invoke({"messages": [{"role": "user", "content": user_msg}]})
         assessment: FinanceLLMAssessment = agent_result["structured_response"]
@@ -149,6 +151,8 @@ def _run_no_ticker_finance(entity_name: str) -> dict[str, Any]:
             raw_score=50,
             summary="Finance assessment could not be completed this run due to an agent error.",
         )
+
+    trace = build_agent_trace("finance", entity_name, (agent_result or {}).get("messages", []))
 
     # Tavily near-always returns *some* results for any query, even
     # irrelevant ones — a non-empty list isn't a meaningful "found
@@ -195,7 +199,7 @@ def _run_no_ticker_finance(entity_name: str) -> dict[str, Any]:
         source_name=source_name,
         source_url=source_url,
     )
-    return {"finance_result": result.model_dump(), "issues": issues}
+    return {"finance_result": result.model_dump(), "issues": issues, "traces": [trace]}
 
 
 def run_finance_agent(state: dict[str, Any]) -> dict[str, Any]:
@@ -218,6 +222,7 @@ def run_finance_agent(state: dict[str, Any]) -> dict[str, Any]:
     user_msg = f"Entity: {entity_name} (ticker: {ticker})"
 
     issues: list[dict[str, Any]] = []
+    agent_result: dict[str, Any] | None = None
     try:
         agent_result = agent.invoke({"messages": [{"role": "user", "content": user_msg}]})
         assessment: FinanceLLMAssessment = agent_result["structured_response"]
@@ -233,6 +238,7 @@ def run_finance_agent(state: dict[str, Any]) -> dict[str, Any]:
             summary="Finance assessment could not be completed this run due to an agent error.",
         )
 
+    trace = build_agent_trace("finance", entity_name, (agent_result or {}).get("messages", []))
     merged = _merge_ticker_tool_results(captured)
     metrics = assemble_market_metrics(ticker, merged)
     fetched_count = _EXPECTED_METRIC_COUNT - len(metrics.unavailable_fields)
@@ -258,4 +264,4 @@ def run_finance_agent(state: dict[str, Any]) -> dict[str, Any]:
         market_metrics=metrics.model_dump(mode="json"),
     )
 
-    return {"finance_result": finance_result.model_dump(), "issues": issues}
+    return {"finance_result": finance_result.model_dump(), "issues": issues, "traces": [trace]}

@@ -24,6 +24,7 @@ from credit_report.model import build_model
 from credit_report.prompt_loader import load_prompt
 from credit_report.schemas import BusinessLLMAssessment, BusinessResult, _BUSINESS_DIMENSIONS
 from credit_report.tool_capture import capturing
+from credit_report.trace import build_agent_trace
 from tools.rating_agency_tools import get_rating_rationale
 from tools.search_tools import search_web_news
 
@@ -102,6 +103,7 @@ def run_business_agent(state: dict[str, Any]) -> dict[str, Any]:
     user_msg = f"Entity: {entity_name}\n\nContext from other specialists:\n\n{context}"
 
     issues: list[dict[str, Any]] = []
+    agent_result: dict[str, Any] | None = None
     try:
         agent_result = agent.invoke({"messages": [{"role": "user", "content": user_msg}]})
         assessment: BusinessLLMAssessment = agent_result["structured_response"]
@@ -123,6 +125,7 @@ def run_business_agent(state: dict[str, Any]) -> dict[str, Any]:
             industry_macro_headwinds=unavailable,
         )
 
+    trace = build_agent_trace("business", entity_name, (agent_result or {}).get("messages", []))
     stats = _compute_deterministic_stats(assessment)
 
     result = BusinessResult(
@@ -136,4 +139,4 @@ def run_business_agent(state: dict[str, Any]) -> dict[str, Any]:
         **stats,
     )
 
-    return {"business_result": result.model_dump(), "issues": issues}
+    return {"business_result": result.model_dump(), "issues": issues, "traces": [trace]}

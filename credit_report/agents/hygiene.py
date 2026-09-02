@@ -24,6 +24,7 @@ from credit_report.model import build_model
 from credit_report.prompt_loader import load_prompt
 from credit_report.schemas import HygieneLLMAssessment, HygieneResult
 from credit_report.tool_capture import capturing
+from credit_report.trace import build_agent_trace
 from schemas import AMLSeverity
 from tools.aml_tools import run_structured_aml_sweep, search_adverse_media
 
@@ -109,9 +110,10 @@ def run_hygiene_agent(state: dict[str, Any]) -> dict[str, Any]:
     )
 
     issues: list[dict[str, Any]] = []
+    agent_result: dict[str, Any] | None = None
     try:
-        result = agent.invoke({"messages": [{"role": "user", "content": user_msg}]})
-        assessment: HygieneLLMAssessment = result["structured_response"]
+        agent_result = agent.invoke({"messages": [{"role": "user", "content": user_msg}]})
+        assessment: HygieneLLMAssessment = agent_result["structured_response"]
     except Exception as exc:
         logger.warning("Hygiene agent failed for %r: %s", entity_name, exc)
         issues.append({
@@ -123,6 +125,8 @@ def run_hygiene_agent(state: dict[str, Any]) -> dict[str, Any]:
             raw_score=50,
             summary="Hygiene assessment could not be completed this run due to an agent error.",
         )
+
+    trace = build_agent_trace("hygiene", entity_name, (agent_result or {}).get("messages", []))
 
     stats = _compute_deterministic_stats(captured)
     if stats["sources_checked"] == 0:
@@ -139,4 +143,4 @@ def run_hygiene_agent(state: dict[str, Any]) -> dict[str, Any]:
         **stats,
     )
 
-    return {"hygiene_result": hygiene_result.model_dump(), "issues": issues}
+    return {"hygiene_result": hygiene_result.model_dump(), "issues": issues, "traces": [trace]}

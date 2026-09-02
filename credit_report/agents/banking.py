@@ -20,6 +20,7 @@ from credit_report.model import build_model
 from credit_report.prompt_loader import load_prompt
 from credit_report.schemas import BankingLLMAssessment, BankingResult, BusinessDimensionFinding, _BUSINESS_DIMENSIONS
 from credit_report.tool_capture import capturing
+from credit_report.trace import build_agent_trace
 from tools.banking_tools import get_banking_sector_benchmark
 from tools.search_tools import search_web_news
 
@@ -108,6 +109,7 @@ def run_banking_agent(state: dict[str, Any]) -> dict[str, Any]:
     user_msg = f"Entity: {entity_name} (bank category: {bank_category or 'unknown'})\n\nContext:\n\n{context}"
 
     issues: list[dict[str, Any]] = []
+    agent_result: dict[str, Any] | None = None
     try:
         agent_result = agent.invoke({"messages": [{"role": "user", "content": user_msg}]})
         assessment: BankingLLMAssessment = agent_result["structured_response"]
@@ -135,6 +137,7 @@ def run_banking_agent(state: dict[str, Any]) -> dict[str, Any]:
             "severity": "info",
         })
 
+    trace = build_agent_trace("banking", entity_name, (agent_result or {}).get("messages", []))
     stats = _compute_deterministic_stats(assessment)
 
     result = BankingResult(
@@ -151,4 +154,4 @@ def run_banking_agent(state: dict[str, Any]) -> dict[str, Any]:
         **stats,
     )
 
-    return {"banking_result": result.model_dump(), "issues": issues}
+    return {"banking_result": result.model_dump(), "issues": issues, "traces": [trace]}

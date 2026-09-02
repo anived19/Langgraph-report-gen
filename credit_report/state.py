@@ -38,3 +38,9 @@ class CreditReportState(TypedDict, total=False):
 
     # Accumulated across every stage — never blocks the pipeline
     issues: Annotated[list[dict], operator.add]
+
+    # One entry per LLM-backed agent (Hygiene/Finance/Business/Banking) — the
+    # full internal ReAct loop trace (every model turn, every tool call and
+    # result, in order), not just the final structured output. See
+    # credit_report/trace.py. Same accumulation reasoning as `issues`.
+    traces: Annotated[list[dict], operator.add]

@@ -15,6 +15,7 @@ import sys
 from credit_report.graph import build_credit_report_graph
 from credit_report.reporting.pdf import compile_credit_report_pdf
 from credit_report.schemas import CreditReport
+from credit_report.trace import dump_traces
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("credit_report.cli")
@@ -42,6 +43,13 @@ def generate_credit_report(company_reference: str) -> None:
     print("[2/2] Rendering PDF...")
     report = CreditReport.model_validate(report_dict)
     pdf_path = compile_credit_report_pdf(report)
+
+    try:
+        trace_path = dump_traces(result.get("traces", []), report.company_name)
+        print(f"      -> Full agent trace (every model turn, every tool call) saved to: {trace_path}")
+    except Exception:
+        logger.warning("Could not write trace file — report itself still completed fine.", exc_info=True)
+
     print(f"\nDone. Credit report saved to: {pdf_path}\n")
 
 
