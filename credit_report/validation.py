@@ -167,14 +167,22 @@ def ungrounded_numbers(text: str, evidence: Iterable[str]) -> list[str]:
     """Figures in `text` that appear nowhere in `evidence` (tool results and
     the context the agent was given), allowing for rounding, percent/fraction
     and lakh/crore/million/billion scaling. Years, small counts (<= 12) and
-    window lengths ("50-day", "6 months", "RSI-14") are not checked."""
+    window lengths ("50-day", "6 months", "RSI-14") are not checked.
+
+    A figure derived from two grounded figures cited in the same text (the
+    % change or ratio between them — "target 2,463.15 is 18.7% above the
+    current 2,075") is accepted once code has re-done the arithmetic. Only
+    pairs the text itself cites are tried, so an invented figure can't pass
+    by coinciding with some ratio of the hundreds of numbers in the tool
+    output."""
     evidence_nums = _numbers_in_evidence(evidence)
-    bad: list[str] = []
+    bad: list[tuple[str, float, int]] = []
+    cited: list[float] = []
     for m in _NUM_IN_TEXT.finditer(text or ""):
         raw = m.group(1)
         value = float(raw.replace(",", ""))
         decimals = len(raw.split(".")[1]) if "." in raw else 0
-        if decimals == 0 and (value <= 12 or 1900 <= value <= 2100):
+        if decimals == 0 and (value <= 12 or (1900 <= value <= 2100 and "," not in raw)):
             continue
         after = (text or "")[m.end():m.end() + 14]
         before = (text or "")[max(0, m.start() - 4):m.start()].lower()
@@ -184,9 +192,19 @@ def ungrounded_numbers(text: str, evidence: Iterable[str]) -> list[str]:
             continue
         if after.startswith("+"):  # an open threshold ("90+ range", "30+ years"), not a cited figure
             continue
-        if not _matches(value, decimals, evidence_nums):
-            bad.append(raw)
-    return list(dict.fromkeys(bad))
+        if _matches(value, decimals, evidence_nums):
+            cited.append(value)
+        else:
+            bad.append((raw, value, decimals))
+
+    derived: set[float] = set()
+    for a in cited:
+        for b in cited:
+            if a != b and b:
+                derived.add(abs(a - b) / b * 100)  # % change from b to a
+                derived.add(a / b)                 # ratio, e.g. "1.2x"
+    return list(dict.fromkeys(raw for raw, value, decimals in bad
+                              if not any(abs(d - value) <= 0.5 * 10 ** -decimals + 1e-9 for d in derived)))
 
 
 def check_numbers_grounded(fields: dict[str, Optional[str]], evidence: Iterable[str]) -> list[str]:

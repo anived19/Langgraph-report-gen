@@ -26,6 +26,14 @@ def test_invented_figures_are_caught():
     assert v.ungrounded_numbers("P/E of 31.2 and revenue growth of 18.6%.", EVIDENCE) == ["31.2", "18.6"]
 
 
+def test_arithmetic_on_cited_figures_is_verified_not_rejected():
+    ev = ['{"analyst_target_mean": 2463.15, "current_price": 2075.0}']
+    assert v.ungrounded_numbers("Target Rs. 2,463.15 is ~18.7% above the current Rs. 2,075.", ev) == []
+    # a wrong derivation is still caught, and so is a % with no cited pair behind it
+    assert v.ungrounded_numbers("Target Rs. 2,463.15 is ~21.4% above the current Rs. 2,075.", ev) == ["21.4"]
+    assert v.ungrounded_numbers("Roughly 18.7% upside.", ev) == ["18.7"]
+
+
 def test_check_dimensions():
     ok = BusinessDimensionFinding(assessment="x", grounding="grounded", source="CRISIL")
     a = BusinessLLMAssessment(
