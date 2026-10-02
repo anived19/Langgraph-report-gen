@@ -83,8 +83,7 @@ def build_agent_trace(agent_name: str, entity_name: str, messages: list[Any]) ->
 def dump_traces(traces: list[dict[str, Any]], company_name: str, output_path: Optional[Path] = None) -> Path:
     """
     Write every agent's trace for one report run to a single JSON file,
-    alongside the PDF — same naming convention as the equity pipeline's own
-    harness/orchestrator.py:_dump_trace(). Never fails the run over this:
+    alongside the PDF. Never fails the run over this:
     a report that generated fine but couldn't write its trace file should
     still complete, not crash — caller should treat this as best-effort.
     """

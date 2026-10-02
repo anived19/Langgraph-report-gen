@@ -1,7 +1,10 @@
 """
-Tavily web search wrapper — exposed to the master orchestrator and research loops.
+Tavily web search wrapper — the agents' only web tool.
 
-Returns a list of dicts (title/url/content/score) rather than a Tavily-specific object.
+Returns a list of dicts (title/url/content/score) rather than a Tavily-specific
+object. Without TAVILY_API_KEY every search returns [] (logged once): each
+agent's completeness ratio already counts a search that found nothing, so the
+report shows the gap instead of the run failing at import.
 """
 from __future__ import annotations
 
@@ -14,7 +17,8 @@ from utils.retry import retry_on_transient_error
 
 logger = logging.getLogger(__name__)
 
-_client = TavilyClient(api_key=settings.tavily_api_key)
+_client = TavilyClient(api_key=settings.tavily_api_key) if settings.tavily_api_key else None
+_warned_no_key = False
 
 
 @retry_on_transient_error(max_attempts=3)
@@ -28,6 +32,13 @@ def search_web_news(
     Search the live web for news/sentiment relevant to `query`.
     `depth` may be 'basic' (1 credit) or 'advanced' (2 credits).
     """
+    global _warned_no_key
+    if _client is None:
+        if not _warned_no_key:
+            logger.warning("TAVILY_API_KEY is not set — web search is disabled for this run.")
+            _warned_no_key = True
+        return []
+
     max_results = max(1, min(max_results, 10))
     search_depth = "advanced" if depth.lower() == "advanced" else "basic"
 

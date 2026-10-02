@@ -12,15 +12,14 @@ credit_report/agents/business.py for the pattern this mirrors.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
-from langchain.agents import create_agent
-
-from credit_report.model import build_model
+from credit_report.agents.business import validate_dimensions
+from credit_report.model import build_agent
 from credit_report.prompt_loader import load_prompt
 from credit_report.schemas import BankingLLMAssessment, BankingResult, BusinessDimensionFinding, _BUSINESS_DIMENSIONS
 from credit_report.tool_capture import capturing
-from credit_report.trace import build_agent_trace
+from credit_report.validation import Attempt, run_with_validation
 from tools.banking_tools import get_banking_sector_benchmark
 from tools.search_tools import search_web_news
 
@@ -28,8 +27,7 @@ logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = load_prompt("banking")
 
-# Named so tests can assert on it directly (tool-isolation check) — this
-# agent gets exactly search_web_news; the RBI benchmark lookup happens
+# This agent gets exactly search_web_news; the RBI benchmark lookup happens
 # deterministically below, not as an agent-invoked tool.
 _BASE_TOOLS = (search_web_news,)
 
@@ -95,31 +93,26 @@ def run_banking_agent(state: dict[str, Any]) -> dict[str, Any]:
 
     benchmark = get_banking_sector_benchmark(bank_category)
 
-    captured: list[dict[str, Any]] = []
-    tools = [capturing(fn, captured) for fn in _BASE_TOOLS]
-
-    agent = create_agent(
-        model=build_model(),
-        tools=tools,
-        system_prompt=_SYSTEM_PROMPT,
-        response_format=BankingLLMAssessment,
-    )
-
     context = _build_context(state, benchmark)
     user_msg = f"Entity: {entity_name} (bank category: {bank_category or 'unknown'})\n\nContext:\n\n{context}"
 
-    issues: list[dict[str, Any]] = []
-    agent_result: dict[str, Any] | None = None
-    try:
-        agent_result = agent.invoke({"messages": [{"role": "user", "content": user_msg}]})
-        assessment: BankingLLMAssessment = agent_result["structured_response"]
-    except Exception as exc:
-        logger.warning("Banking agent failed for %r: %s", entity_name, exc)
-        issues.append({
-            "stage": "banking_agent",
-            "message": f"Banking agent run failed: {exc}",
-            "severity": "error",
-        })
+    def run_once(feedback: Optional[str]) -> Attempt:
+        captured: list[dict[str, Any]] = []
+        agent = build_agent([capturing(fn, captured) for fn in _BASE_TOOLS], _SYSTEM_PROMPT, BankingLLMAssessment)
+        content = user_msg + (f"\n\n{feedback}" if feedback else "")
+        result: dict[str, Any] = {}
+        try:
+            result = agent.invoke({"messages": [{"role": "user", "content": content}]})
+            return Attempt(result["structured_response"], captured, result.get("messages", []))
+        except Exception as exc:
+            logger.warning("Banking agent failed for %r: %s", entity_name, exc)
+            return Attempt(None, captured, result.get("messages", []), exc)
+
+    attempt, issues, traces = run_with_validation(
+        "banking", entity_name, run_once, lambda a: validate_dimensions(a, [user_msg, _SYSTEM_PROMPT]),
+    )
+    assessment = attempt.assessment
+    if assessment is None:
         unavailable = BusinessDimensionFinding(assessment="unavailable", grounding="unavailable")
         assessment = BankingLLMAssessment(
             raw_score=50,
@@ -137,7 +130,6 @@ def run_banking_agent(state: dict[str, Any]) -> dict[str, Any]:
             "severity": "info",
         })
 
-    trace = build_agent_trace("banking", entity_name, (agent_result or {}).get("messages", []))
     stats = _compute_deterministic_stats(assessment)
 
     result = BankingResult(
@@ -154,4 +146,4 @@ def run_banking_agent(state: dict[str, Any]) -> dict[str, Any]:
         **stats,
     )
 
-    return {"banking_result": result.model_dump(), "issues": issues, "traces": [trace]}
+    return {"banking_result": result.model_dump(), "issues": issues, "traces": traces}

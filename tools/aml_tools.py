@@ -3,20 +3,24 @@ AML/ABC screening tool functions.
 
 All sources used here are free and publicly accessible — no paid API key
 is required. Each function is independently callable and returns an AMLFinding
-object, with severity set conservatively:
+object:
 
-  None     — source searched, no match found
-  Watch    — partial / low-confidence name match worth reviewing
+  None     — source searched, no record of this entity
+  Watch    — source unscreened this run (unreachable / gated), or jurisdictional context
   Elevated — confirmed presence on a sanctions or debarment list
-  High     — confirmed presence on OFAC SDN or UN asset-freeze list
+  High     — confirmed presence on OFAC SDN or the World Bank debarment list
 
-Screening logic:
-  - Robust error handling: all HTTP / network exceptions return clean, professional
-    status strings rather than dumping raw Python exception traces into report tables.
-  - Accurate entity matching: parses structured XML/JSON nodes with whole-word token matching
-    to prevent false positives on subwords.
-  - Secondary LLM filtering: adverse media web searches undergo secondary verification to
-    eliminate image strings, broken assets, generic code of ethics releases, and unrelated noise.
+"Confirmed" means exact entity only (tools/name_match.py): the record's name
+is identical to the entity's after formatting-only normalisation AND the
+record carries one of the entity's identifiers (CIN / PAN). A same-name
+record with no identifier is listed in the finding's `analyst_review` and
+never scored; near names never match at all. A source that couldn't be
+reached is reported as unscreened (Watch), never the same way as a source
+that was reached and came back empty.
+
+Adverse media web searches go through a secondary LLM filter (shared model
+and rate limiter, credit_report/model.py) to drop image strings, broken
+assets, generic code-of-ethics releases, and unrelated noise.
 """
 from __future__ import annotations
 
@@ -28,15 +32,15 @@ import re
 import time
 from datetime import date
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import httpx
 import requests
-from google import genai
-from google.genai import types
+from pydantic import BaseModel, Field
 
 from config import settings
 from schemas import AMLFinding, AMLSeverity
+from tools.name_match import identifier_verdict, same_name
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +175,10 @@ _GENERIC_STOP_WORDS = {
 
 def _name_matches(entity: str, target: str) -> bool:
     """
-    Precise whole-token entity name matcher.
+    Whole-token name matcher. Used ONLY by tools/bank_classifier.py to find
+    the entity on RBI's bank list (routing, not screening) — a sanctions /
+    watchlist / PEP record must never be matched with this; screens use the
+    exact-entity rule in tools/name_match.py.
     - Exact normalized equality: 'tata consultancy services' == 'tata consultancy services'
     - Multi-word sequence match: all distinctive words in entity must appear as whole words in target
     - Single-word match: must match target as a whole word and target must not be an unrelated individual with >3 tokens
@@ -229,6 +236,77 @@ def _clean_and_filter_url(url: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Exact-entity match bookkeeping (see tools/name_match.py for the rule)
+# ---------------------------------------------------------------------------
+
+class _MatchLog:
+    """Collects one source's exact-name records by identifier verdict. A
+    record counts against the entity only when confirmed (exact name AND one
+    of the entity's identifiers); same-name records with no identifier go to
+    `analyst_review`; same-name records carrying other identifiers are other
+    entities and are only counted in the note."""
+
+    def __init__(self, entity_name: str, entity_ids: Optional[list[str]] = None):
+        self.entity_name = entity_name
+        self.entity_ids = [i for i in (entity_ids or []) if i]
+        self.confirmed: list[str] = []
+        self.same_name_only: list[str] = []
+        self.different = 0
+
+    def check(self, record_name: str, record_text: str, label: str = "") -> None:
+        if not record_name or not same_name(self.entity_name, record_name):
+            return
+        verdict = identifier_verdict(record_text, self.entity_ids)
+        desc = f"'{record_name.strip()}'" + (f" ({label})" if label else "")
+        if verdict == "confirmed":
+            self.confirmed.append(desc)
+        elif verdict == "same_name_only":
+            self.same_name_only.append(desc)
+        else:
+            self.different += 1
+
+    def finding(self, source_name: str, source_url: str, confirmed_severity: AMLSeverity) -> AMLFinding:
+        review = [f"{source_name}: same-name record {d} carries no identifier proving it is this entity — "
+                  f"analyst to rule out; not scored." for d in dict.fromkeys(self.same_name_only)]
+        if self.confirmed:
+            summary = (f"Exact name AND identifier match on {source_name} ({len(self.confirmed)} record(s)): "
+                       f"{'; '.join(self.confirmed[:3])}. Requires compliance action.")
+            return AMLFinding(entity_screened=self.entity_name, source_name=source_name, finding_summary=summary,
+                              severity=confirmed_severity, source_url=source_url, analyst_review=review)
+        summary = f"No record of this entity on {source_name}."
+        if self.different:
+            summary += f" {self.different} same-name record(s) carry other identifiers (different entities)."
+        if review:
+            summary += f" {len(review)} same-name record(s) without an identifier are listed for analyst review, not scored."
+        return AMLFinding(entity_screened=self.entity_name, source_name=source_name, finding_summary=summary,
+                          severity=AMLSeverity.NONE, source_url=source_url, analyst_review=review)
+
+
+def _unscreened(entity_name: str, source_name: str, source_url: str, why: str) -> AMLFinding:
+    """A source that couldn't be reached is never reported the same way as a
+    source that was reached and came back empty."""
+    return AMLFinding(
+        entity_screened=entity_name,
+        source_name=source_name,
+        finding_summary=f"Screen unavailable this run ({why}) — unscreened, not counted as clean.",
+        severity=AMLSeverity.WATCH,
+        source_url=source_url,
+    )
+
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _child_text(elem, *names: str) -> str:
+    parts = []
+    for child in elem:
+        if _local(child.tag) in names and child.text and child.text.strip():
+            parts.append(child.text.strip())
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Source 1: OFAC Specially Designated Nationals (SDN) List
 # ---------------------------------------------------------------------------
 
@@ -237,51 +315,37 @@ _OFAC_URLS = [
     "https://data.treasury.gov/feed/sdn.xml",
 ]
 
-def screen_ofac_sdn(entity_name: str) -> AMLFinding:
+
+def screen_ofac_sdn(entity_name: str, entity_ids: Optional[list[str]] = None) -> AMLFinding:
     """Screen entity against the official US OFAC Specially Designated Nationals list."""
-    source_url = "https://sanctionslist.ofac.treas.gov/Home/SdnList"
+    source_name, source_url = "OFAC SDN List", "https://sanctionslist.ofac.treas.gov/Home/SdnList"
     try:
         xml_text = None
         for url in _OFAC_URLS:
             xml_text = _cached_get(url, ttl_hours=24)
             if xml_text:
                 break
+        if not xml_text:
+            return _unscreened(entity_name, source_name, source_url, "list could not be downloaded")
 
-        if xml_text:
-            import xml.etree.ElementTree as ET
-            root = ET.fromstring(xml_text)
-            matched = False
-            for entry in root.iter():
-                tag = entry.tag.lower()
-                if "lastname" in tag or "firstname" in tag or "sdnname" in tag or "akaname" in tag:
-                    if entry.text and _name_matches(entity_name, entry.text):
-                        matched = True
-                        break
-            if matched:
-                return AMLFinding(
-                    entity_screened=entity_name,
-                    source_name="OFAC SDN List",
-                    finding_summary=f"Name match found in OFAC Specially Designated Nationals (SDN) registry. Requires manual compliance verification.",
-                    severity=AMLSeverity.HIGH,
-                    source_url=source_url,
-                )
-
-        return AMLFinding(
-            entity_screened=entity_name,
-            source_name="OFAC SDN List",
-            finding_summary="No match found in OFAC Specially Designated Nationals list.",
-            severity=AMLSeverity.NONE,
-            source_url=source_url,
-        )
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(xml_text)
+        log = _MatchLog(entity_name, entity_ids)
+        for entry in root.iter():
+            if _local(entry.tag) != "sdnEntry":
+                continue
+            record_text = ET.tostring(entry, encoding="unicode")
+            uid = _child_text(entry, "uid")
+            names = [_child_text(entry, "firstName", "lastName")]
+            for aka in entry.iter():
+                if _local(aka.tag) == "aka":
+                    names.append(_child_text(aka, "firstName", "lastName"))
+            for name in names:
+                log.check(name, record_text, f"SDN uid {uid}" if uid else "")
+        return log.finding(source_name, source_url, AMLSeverity.HIGH)
     except Exception as exc:
-        logger.warning("OFAC SDN screen completed with fallback for %r: %s", entity_name, exc)
-        return AMLFinding(
-            entity_screened=entity_name,
-            source_name="OFAC SDN List",
-            finding_summary="No match identified in available OFAC SDN screening registry records.",
-            severity=AMLSeverity.NONE,
-            source_url=source_url,
-        )
+        logger.warning("OFAC SDN screen failed for %r: %s", entity_name, exc)
+        return _unscreened(entity_name, source_name, source_url, type(exc).__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -290,69 +354,38 @@ def screen_ofac_sdn(entity_name: str) -> AMLFinding:
 
 _OPENSANCTIONS_URL = "https://api.opensanctions.org/entities/_search"
 
-def screen_opensanctions(entity_name: str) -> AMLFinding:
-    """Screen against OpenSanctions aggregator (aggregates 100+ global watchlists)."""
+
+def screen_opensanctions(entity_name: str, entity_ids: Optional[list[str]] = None) -> AMLFinding:
+    """Screen against OpenSanctions aggregator (aggregates 100+ global
+    watchlists). The API answers 401 without a key: that is an unscreened
+    source, not a clean one."""
+    source_name = "OpenSanctions Database"
     source_url = f"https://www.opensanctions.org/search/?q={requests.utils.quote(entity_name)}"
-    api_key = getattr(settings, "opensanctions_api_key", None) or os.environ.get("OPENSANCTIONS_API_KEY")
-    headers = {}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    api_key = os.environ.get("OPENSANCTIONS_API_KEY")
+    headers = {"Authorization": f"ApiKey {api_key}"} if api_key else {}
 
     try:
         resp = _SESSION.get(
             _OPENSANCTIONS_URL,
-            params={"q": entity_name, "limit": 5, "schema": "Thing"},
+            params={"q": entity_name, "limit": 10, "schema": "LegalEntity"},
             headers=headers,
             timeout=_TIMEOUT,
         )
         if resp.status_code in (401, 403):
-            # Gracefully note underlying direct registry verification
-            return AMLFinding(
-                entity_screened=entity_name,
-                source_name="OpenSanctions Database",
-                finding_summary="Screened against primary underlying global registries (OFAC, UN, EU, World Bank). No sanctions matches found.",
-                severity=AMLSeverity.NONE,
-                source_url=source_url,
-            )
+            return _unscreened(entity_name, source_name, source_url,
+                               "the OpenSanctions API needs an API key (OPENSANCTIONS_API_KEY)")
         resp.raise_for_status()
-        data = resp.json()
-        results = data.get("results", [])
-        matches = [
-            r for r in results
-            if _name_matches(entity_name, " ".join(
-                r.get("properties", {}).get("name", []) +
-                r.get("properties", {}).get("alias", [])
-            ))
-        ]
-        if matches:
-            datasets = list({ds for r in matches for ds in r.get("datasets", [])})
-            return AMLFinding(
-                entity_screened=entity_name,
-                source_name="OpenSanctions Database",
-                finding_summary=(
-                    f"Potential match(es) found in OpenSanctions aggregated database "
-                    f"(datasets: {', '.join(datasets[:5]) or 'sanctions/watchlists'}). "
-                    f"Requires manual verification."
-                ),
-                severity=AMLSeverity.ELEVATED,
-                source_url=source_url,
-            )
-        return AMLFinding(
-            entity_screened=entity_name,
-            source_name="OpenSanctions Database",
-            finding_summary="No match found in OpenSanctions database.",
-            severity=AMLSeverity.NONE,
-            source_url=source_url,
-        )
+        log = _MatchLog(entity_name, entity_ids)
+        for r in resp.json().get("results", []):
+            props = r.get("properties", {})
+            record_text = json.dumps(r)
+            datasets = ", ".join(r.get("datasets", [])[:3])
+            for name in props.get("name", []) + props.get("alias", []):
+                log.check(name, record_text, datasets)
+        return log.finding(source_name, source_url, AMLSeverity.ELEVATED)
     except Exception as exc:
-        logger.warning("OpenSanctions screen completed with fallback for %r: %s", entity_name, exc)
-        return AMLFinding(
-            entity_screened=entity_name,
-            source_name="OpenSanctions Database",
-            finding_summary="Screened against primary underlying global registries (OFAC, UN, EU, World Bank). No sanctions matches found.",
-            severity=AMLSeverity.NONE,
-            source_url=source_url,
-        )
+        logger.warning("OpenSanctions screen failed for %r: %s", entity_name, exc)
+        return _unscreened(entity_name, source_name, source_url, type(exc).__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -366,15 +399,15 @@ def screen_opensanctions(entity_name: str) -> AMLFinding:
 # static `apikey` header that the page's own JS ships to every anonymous visitor
 # (observed via a live Playwright network trace against the public page — this is
 # not a bypassed paywall, it's the same key every browser loading that public page
-# receives). If World Bank rotates this key, `_cached_get`'s tier-3 browser fallback
-# still can't recover a JS-injected XHR header on its own — a screener failure here
-# degrades to "no match / manual review", per the fail-closed severity policy below,
-# not a fabricated result.
+# receives). If World Bank rotates this key the fetch fails and the source is
+# reported as unscreened, not as clean.
 _WB_URL = "https://apigwext.worldbank.org/dvsvc/v1.0/json/APPLICATION/ADOBE_EXPRNCE_MGR/FIRM/SANCTIONED_FIRM"
 _WB_PUBLIC_API_KEY = "z9duUaFUiEUYSHs97CU38fcZO7ipOPvm"
 
-def screen_world_bank_debarred(entity_name: str) -> AMLFinding:
+
+def screen_world_bank_debarred(entity_name: str, entity_ids: Optional[list[str]] = None) -> AMLFinding:
     """Screen against the World Bank Integrity Vice Presidency debarment list."""
+    source_name = "World Bank Debarred Entities"
     source_url = "https://www.worldbank.org/en/projects-operations/procurement/debarred-firms"
     try:
         text = _cached_get(
@@ -382,35 +415,18 @@ def screen_world_bank_debarred(entity_name: str) -> AMLFinding:
             ttl_hours=24,
             headers={"apikey": _WB_PUBLIC_API_KEY, "Accept": "application/json"},
         )
-        if text:
-            data = json.loads(text)
-            firms = data.get("response", {}).get("ZPROCSUPP", [])
-            if isinstance(firms, list):
-                matches = [f for f in firms if _name_matches(entity_name, str(f.get("SUPP_NAME", "")))]
-                if matches:
-                    return AMLFinding(
-                        entity_screened=entity_name,
-                        source_name="World Bank Debarred Entities",
-                        finding_summary=f"Name match found in World Bank procurement debarment registry ({len(matches)} entry/entries). Requires manual verification.",
-                        severity=AMLSeverity.HIGH,
-                        source_url=source_url,
-                    )
-        return AMLFinding(
-            entity_screened=entity_name,
-            source_name="World Bank Debarred Entities",
-            finding_summary="No match found in World Bank debarment list.",
-            severity=AMLSeverity.NONE,
-            source_url=source_url,
-        )
+        if not text:
+            return _unscreened(entity_name, source_name, source_url, "list could not be downloaded")
+        firms = json.loads(text).get("response", {}).get("ZPROCSUPP", [])
+        if not isinstance(firms, list):
+            return _unscreened(entity_name, source_name, source_url, "unexpected response shape")
+        log = _MatchLog(entity_name, entity_ids)
+        for f in firms:
+            log.check(str(f.get("SUPP_NAME", "")), json.dumps(f), str(f.get("COUNTRY_NAME") or ""))
+        return log.finding(source_name, source_url, AMLSeverity.HIGH)
     except Exception as exc:
-        logger.warning("World Bank debarment screen completed with fallback for %r: %s", entity_name, exc)
-        return AMLFinding(
-            entity_screened=entity_name,
-            source_name="World Bank Debarred Entities",
-            finding_summary="No match found in World Bank debarment list.",
-            severity=AMLSeverity.NONE,
-            source_url=source_url,
-        )
+        logger.warning("World Bank debarment screen failed for %r: %s", entity_name, exc)
+        return _unscreened(entity_name, source_name, source_url, type(exc).__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -418,47 +434,36 @@ def screen_world_bank_debarred(entity_name: str) -> AMLFinding:
 # ---------------------------------------------------------------------------
 
 _UN_XML_URL = "https://scsanctions.un.org/resources/xml/en/consolidated.xml"
+_UN_NAME_PARTS = ("FIRST_NAME", "SECOND_NAME", "THIRD_NAME", "FOURTH_NAME")
 
-def screen_un_sanctions(entity_name: str) -> AMLFinding:
+
+def screen_un_sanctions(entity_name: str, entity_ids: Optional[list[str]] = None) -> AMLFinding:
     """Screen against the UN Security Council Consolidated Sanctions List."""
+    source_name = "UN SC Consolidated List"
     source_url = "https://www.un.org/securitycouncil/content/un-sc-consolidated-list"
     try:
         xml_text = _cached_get(_UN_XML_URL, ttl_hours=_XML_CACHE_TTL_HOURS)
-        if xml_text:
-            import xml.etree.ElementTree as ET
-            root = ET.fromstring(xml_text)
-            matched = False
-            for elem in root.iter():
-                tag = elem.tag.upper()
-                # Target exact name elements in UN XML
-                if tag in ("FIRST_NAME", "SECOND_NAME", "THIRD_NAME", "FOURTH_NAME", "ENTITY_NAME", "NAME_ORIGINAL_SCRIPT", "ALIAS_NAME"):
-                    if elem.text and _name_matches(entity_name, elem.text):
-                        matched = True
-                        break
-            if matched:
-                return AMLFinding(
-                    entity_screened=entity_name,
-                    source_name="UN SC Consolidated List",
-                    finding_summary="Name match found in UN Security Council Consolidated Sanctions List. Requires manual verification to confirm match.",
-                    severity=AMLSeverity.ELEVATED,
-                    source_url=source_url,
-                )
-        return AMLFinding(
-            entity_screened=entity_name,
-            source_name="UN SC Consolidated List",
-            finding_summary="No match found in UN Security Council Consolidated Sanctions List.",
-            severity=AMLSeverity.NONE,
-            source_url=source_url,
-        )
+        if not xml_text:
+            return _unscreened(entity_name, source_name, source_url, "list could not be downloaded")
+
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(xml_text)
+        log = _MatchLog(entity_name, entity_ids)
+        for entry in root.iter():
+            if _local(entry.tag) not in ("INDIVIDUAL", "ENTITY"):
+                continue
+            record_text = ET.tostring(entry, encoding="unicode")
+            ref = _child_text(entry, "REFERENCE_NUMBER")
+            names = [_child_text(entry, *_UN_NAME_PARTS), _child_text(entry, "NAME_ORIGINAL_SCRIPT")]
+            for alias in entry.iter():
+                if _local(alias.tag) in ("INDIVIDUAL_ALIAS", "ENTITY_ALIAS"):
+                    names.append(_child_text(alias, "ALIAS_NAME"))
+            for name in names:
+                log.check(name, record_text, f"ref {ref}" if ref else "")
+        return log.finding(source_name, source_url, AMLSeverity.ELEVATED)
     except Exception as exc:
-        logger.warning("UN sanctions screen completed with fallback for %r: %s", entity_name, exc)
-        return AMLFinding(
-            entity_screened=entity_name,
-            source_name="UN SC Consolidated List",
-            finding_summary="No match found in UN Security Council Consolidated Sanctions List.",
-            severity=AMLSeverity.NONE,
-            source_url=source_url,
-        )
+        logger.warning("UN sanctions screen failed for %r: %s", entity_name, exc)
+        return _unscreened(entity_name, source_name, source_url, type(exc).__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -470,61 +475,34 @@ def screen_un_sanctions(entity_name: str) -> AMLFinding:
 # not just a 403/blocked-header guess. This is a real authentication wall, not a bot
 # block, so no amount of header-spoofing or browser rendering recovers it without a
 # registered EU Login credential. Left wired up (in case the EU reopens anonymous access
-# or a credential is added later), but a failed fetch is reported honestly as
-# "unavailable" (Watch) rather than silently downgraded to "no match found" (None) —
-# OpenSanctions' aggregated feed (screen_opensanctions, above) includes the EU FSF list
-# as one of its underlying datasets, so EU coverage isn't fully lost even while this
-# direct source is gated.
+# or a credential is added later); a failed fetch is reported as unscreened.
 _EU_XML_URL = "https://webgate.ec.europa.eu/fsd/fsf/public/files/xmlFullSanctionsList_1_1/content"
 
-def screen_eu_sanctions(entity_name: str) -> AMLFinding:
+
+def screen_eu_sanctions(entity_name: str, entity_ids: Optional[list[str]] = None) -> AMLFinding:
     """Screen against the EU Financial Sanctions File."""
-    source_url = "https://www.sanctionsmap.eu/"
-    unavailable_finding = AMLFinding(
-        entity_screened=entity_name,
-        source_name="EU Financial Sanctions List",
-        finding_summary=(
-            "EU Financial Sanctions File direct download is not reachable anonymously "
-            "(requires an authenticated EU Login session as of this screening run). "
-            "EU sanctions coverage is still included via the OpenSanctions aggregated "
-            "screen above; treat this row as unscreened directly, not as clean."
-        ),
-        severity=AMLSeverity.WATCH,
-        source_url=source_url,
-    )
+    source_name, source_url = "EU Financial Sanctions List", "https://www.sanctionsmap.eu/"
     try:
         xml_text = _cached_get(_EU_XML_URL, ttl_hours=_XML_CACHE_TTL_HOURS)
         if not xml_text:
-            return unavailable_finding
+            return _unscreened(entity_name, source_name, source_url,
+                               "the EU file needs an authenticated EU Login session")
 
         import xml.etree.ElementTree as ET
         root = ET.fromstring(xml_text)
-        matched = False
-        for elem in root.iter():
-            tag = elem.tag.lower()
-            if "name" in tag or "alias" in tag:
-                text_val = elem.text or elem.attrib.get("wholeName", "") or elem.attrib.get("name", "")
-                if text_val and _name_matches(entity_name, text_val):
-                    matched = True
-                    break
-        if matched:
-            return AMLFinding(
-                entity_screened=entity_name,
-                source_name="EU Financial Sanctions List",
-                finding_summary="Name match found in EU Financial Sanctions File. Requires manual verification to confirm match.",
-                severity=AMLSeverity.ELEVATED,
-                source_url=source_url,
-            )
-        return AMLFinding(
-            entity_screened=entity_name,
-            source_name="EU Financial Sanctions List",
-            finding_summary="No match found in EU Financial Sanctions List.",
-            severity=AMLSeverity.NONE,
-            source_url=source_url,
-        )
+        log = _MatchLog(entity_name, entity_ids)
+        for entry in root.iter():
+            if _local(entry.tag) != "sanctionEntity":
+                continue
+            record_text = ET.tostring(entry, encoding="unicode")
+            ref = entry.attrib.get("euReferenceNumber", "")
+            for alias in entry.iter():
+                if _local(alias.tag) == "nameAlias":
+                    log.check(alias.attrib.get("wholeName", ""), record_text, f"EU ref {ref}" if ref else "")
+        return log.finding(source_name, source_url, AMLSeverity.ELEVATED)
     except Exception as exc:
-        logger.warning("EU sanctions screen completed with fallback for %r: %s", entity_name, exc)
-        return unavailable_finding
+        logger.warning("EU sanctions screen failed for %r: %s", entity_name, exc)
+        return _unscreened(entity_name, source_name, source_url, type(exc).__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -533,49 +511,46 @@ def screen_eu_sanctions(entity_name: str) -> AMLFinding:
 
 _SEC_EDGAR_URL = "https://efts.sec.gov/LATEST/search-index"
 
-def screen_sec_fcpa(entity_name: str) -> AMLFinding:
-    """Search SEC EDGAR litigation releases for FCPA-related mentions of the entity."""
-    source_url = f"https://efts.sec.gov/LATEST/search-index?q=%22{requests.utils.quote(entity_name)}%22+FCPA&dateRange=custom&startdt=2010-01-01"
+
+def screen_sec_fcpa(entity_name: str, entity_ids: Optional[list[str]] = None) -> AMLFinding:
+    """Search SEC EDGAR litigation releases for FCPA-related mentions of the
+    entity. A full-text mention carries no identifier, so hits are listed for
+    the analyst and never scored."""
+    source_name = "SEC EDGAR — FCPA Litigation Releases"
+    source_url = (f"https://efts.sec.gov/LATEST/search-index?q=%22{requests.utils.quote(entity_name)}%22+FCPA"
+                  f"&dateRange=custom&startdt=2010-01-01")
     try:
         headers = {"User-Agent": "financial-research-tool/1.0 (compliance@reportagentic.org)"}
         resp = _SESSION.get(
             _SEC_EDGAR_URL,
-            params={
-                "q": f'"{entity_name}" FCPA',
-                "dateRange": "custom",
-                "startdt": "2010-01-01",
-                "forms": "LR",
-            },
+            params={"q": f'"{entity_name}" FCPA', "dateRange": "custom", "startdt": "2010-01-01", "forms": "LR"},
             headers=headers,
             timeout=_TIMEOUT,
         )
-        if resp.status_code == 200:
-            data = resp.json()
-            hits = data.get("hits", {}).get("hits", [])
-            if hits:
-                return AMLFinding(
-                    entity_screened=entity_name,
-                    source_name="SEC EDGAR — FCPA Litigation Releases",
-                    finding_summary=f"{len(hits)} SEC litigation release(s) found mentioning this entity in an FCPA context. Review required.",
-                    severity=AMLSeverity.ELEVATED,
-                    source_url=source_url,
-                )
+        if resp.status_code != 200:
+            return _unscreened(entity_name, source_name, source_url, f"HTTP {resp.status_code}")
+        hits = resp.json().get("hits", {}).get("hits", [])
+        if hits:
+            return AMLFinding(
+                entity_screened=entity_name,
+                source_name=source_name,
+                finding_summary=(f"{len(hits)} SEC litigation release(s) mention this name in an FCPA context; "
+                                 f"listed for analyst review, not scored."),
+                severity=AMLSeverity.NONE,
+                source_url=source_url,
+                analyst_review=[f"{source_name}: {len(hits)} release(s) mention '{entity_name}' with FCPA — "
+                                f"analyst to confirm it is this entity: {source_url}"],
+            )
         return AMLFinding(
             entity_screened=entity_name,
-            source_name="SEC EDGAR — FCPA Litigation Releases",
+            source_name=source_name,
             finding_summary="No FCPA litigation releases found for this entity on SEC EDGAR.",
             severity=AMLSeverity.NONE,
             source_url=source_url,
         )
     except Exception as exc:
-        logger.warning("SEC EDGAR FCPA screen completed with fallback for %r: %s", entity_name, exc)
-        return AMLFinding(
-            entity_screened=entity_name,
-            source_name="SEC EDGAR — FCPA Litigation Releases",
-            finding_summary="No FCPA litigation releases found for this entity on SEC EDGAR.",
-            severity=AMLSeverity.NONE,
-            source_url="https://www.sec.gov/divisions/enforce/enforcements-actions/fcpa-cases",
-        )
+        logger.warning("SEC EDGAR FCPA screen failed for %r: %s", entity_name, exc)
+        return _unscreened(entity_name, source_name, source_url, type(exc).__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -702,6 +677,7 @@ _COUNTRY_CODE_TO_NAME: dict[str, str] = {
     "MU": "Mauritius",
 }
 
+
 def _classify_severity(text: str) -> AMLSeverity:
     t = text.lower()
     if any(kw in t for kw in _HIGH_SEVERITY_KEYWORDS):
@@ -711,10 +687,23 @@ def _classify_severity(text: str) -> AMLSeverity:
     return AMLSeverity.WATCH
 
 
+class _MediaFinding(BaseModel):
+    source_url: str = Field(description="URL of the candidate this finding comes from, copied exactly")
+    finding_summary: str
+    severity: Literal["High", "Elevated", "Watch"]
+
+
+class _MediaFilterResult(BaseModel):
+    """Genuine adverse findings retained from the candidates; empty if none."""
+    findings: list[_MediaFinding] = Field(default_factory=list)
+
+
 def _filter_adverse_media_with_llm(entity_name: str, raw_results: list[dict]) -> list[AMLFinding]:
     """
     Secondary LLM verification filter to eliminate image artifacts, broken links,
-    generic CSR/ESG statements (e.g. gender pay gap), and general noise.
+    generic CSR/ESG statements (e.g. gender pay gap), and general noise. Runs on
+    the shared model and rate limiter (credit_report/model.py); a finding whose
+    URL isn't one of the candidates is dropped in code.
     """
     valid_candidates = []
     seen_urls = set()
@@ -737,7 +726,6 @@ def _filter_adverse_media_with_llm(entity_name: str, raw_results: list[dict]) ->
     if not valid_candidates:
         return []
 
-    client = genai.Client(api_key=settings.gemini_api_key)
     filter_prompt = (
         "You are a Senior Regulatory Compliance & AML Due Diligence Officer.\n"
         f"Target Entity: {entity_name}\n\n"
@@ -749,50 +737,28 @@ def _filter_adverse_media_with_llm(entity_name: str, raw_results: list[dict]) ->
         "   - Discard routine corporate governance, CSR, ESG, diversity reports (e.g. UK Gender Pay Gap), or Code of Ethics releases.\n"
         "   - Discard general industry/macro news articles that only mention the target entity in passing.\n"
         "   - Discard promotional product reviews, broken links, or generic market wrap-ups.\n"
-        "3. Output a valid JSON array of retained findings:\n"
-        '[\n  {"source_url": "...", "finding_summary": "...", "severity": "Elevated"}\n]\n'
-        "If NO genuine adverse regulatory/compliance findings exist, return an empty array: []"
+        "3. Copy each retained finding's source_url exactly from its candidate. If NO genuine adverse "
+        "regulatory/compliance findings exist, return an empty findings list."
     )
 
     try:
-        from harness.gemini_retry import generate_with_retry
-        response = generate_with_retry(
-            client,
-            model=settings.gemini_model,
-            contents=[
-                types.Content(
-                    role="user",
-                    parts=[types.Part(text=f"{filter_prompt}\n\nCANDIDATES (JSON):\n{json.dumps(valid_candidates, indent=2)}")]
-                )
-            ],
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        from credit_report.model import structured_call
+
+        result: _MediaFilterResult = structured_call(
+            _MediaFilterResult,
+            f"{filter_prompt}\n\nCANDIDATES (JSON):\n{json.dumps(valid_candidates, indent=2)}",
         )
-        text = (response.text or "").strip()
-        if not text:
-            return []
-        data = json.loads(text)
-        if not isinstance(data, list):
-            return []
-
         verified_findings: list[AMLFinding] = []
-        for item in data:
-            url = _clean_and_filter_url(item.get("source_url", ""))
-            summary = item.get("finding_summary", "").strip()
-            sev_str = str(item.get("severity", "Watch")).title()
-            if not summary or not url:
+        for item in result.findings:
+            url = _clean_and_filter_url(item.source_url)
+            summary = item.finding_summary.strip()
+            if not summary or url not in seen_urls:
                 continue
-            if sev_str == "High":
-                sev = AMLSeverity.HIGH
-            elif sev_str == "Elevated":
-                sev = AMLSeverity.ELEVATED
-            else:
-                sev = AMLSeverity.WATCH
-
             verified_findings.append(AMLFinding(
                 entity_screened=entity_name,
                 source_name="Adverse Media (Verified Search)",
                 finding_summary=summary,
-                severity=sev,
+                severity=AMLSeverity(item.severity),
                 source_url=url,
             ))
         return verified_findings
@@ -847,25 +813,31 @@ def search_adverse_media(
         findings.append(AMLFinding(
             entity_screened=entity_name,
             source_name="Adverse Media (Tavily search)",
-            finding_summary="No adverse regulatory, enforcement, or AML/ABC compliance media found for this entity in this search cycle.",
-            severity=AMLSeverity.NONE,
+            finding_summary=(
+                "No adverse regulatory, enforcement, or AML/ABC compliance media found for this entity in this search cycle."
+                if raw_results else
+                "Adverse media search returned no results this run (web search unavailable or empty) — unscreened, not counted as clean."
+            ),
+            severity=AMLSeverity.NONE if raw_results else AMLSeverity.WATCH,
             source_url="",
         ))
 
     return [f.model_dump() for f in findings]
 
 
-def run_structured_aml_sweep(entity_name: str, ticker: str = "") -> list[dict[str, Any]]:
+def run_structured_aml_sweep(
+    entity_name: str, ticker: str = "", entity_ids: Optional[list[str]] = None
+) -> list[dict[str, Any]]:
     """
-    Bundled deterministic sweep: sweeps OFAC, OpenSanctions, World Bank,
-    UN, EU, SEC EDGAR, TI CPI, and FATF in parallel in one call.
+    Bundled deterministic sweep: OFAC, OpenSanctions, World Bank, UN, EU and
+    SEC EDGAR in parallel for the entity's name, plus jurisdictional risk
+    (TI CPI, FATF). `entity_ids` (CIN / PAN) decide whether an exact-name
+    record is this entity; they are bound in code by the caller and never
+    come from, or go to, the LLM.
     """
     import concurrent.futures
 
-    entities = [entity_name.strip()] if entity_name else []
-    if ticker and ticker.strip() and ticker.strip() not in entities:
-        entities.append(ticker.strip())
-
+    name = (entity_name or "").strip()
     screeners = [
         screen_ofac_sdn,
         screen_opensanctions,
@@ -875,28 +847,17 @@ def run_structured_aml_sweep(entity_name: str, ticker: str = "") -> list[dict[st
         screen_sec_fcpa,
     ]
 
-    tasks = []
-    for ent in entities:
-        for fn in screeners:
-            tasks.append((ent, fn))
-
-    def _exec_screener(item: tuple) -> AMLFinding:
-        ent, fn = item
+    def _exec_screener(fn) -> AMLFinding:
         try:
-            return fn(ent)
+            return fn(name, entity_ids)
         except Exception as exc:
-            logger.warning("Screener %s error for %r: %s", fn.__name__, ent, exc)
-            return AMLFinding(
-                entity_screened=ent,
-                source_name=fn.__name__.replace("_", " ").title(),
-                finding_summary="No confirmed match identified in public database records.",
-                severity=AMLSeverity.NONE,
-                source_url="",
-            )
+            logger.warning("Screener %s error for %r: %s", fn.__name__, name, exc)
+            return _unscreened(name, fn.__name__.replace("_", " ").title(), "", type(exc).__name__)
 
     findings: list[AMLFinding] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(tasks) or 1, 8)) as executor:
-        findings.extend(list(executor.map(_exec_screener, tasks)))
+    if name:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(screeners)) as executor:
+            findings.extend(executor.map(_exec_screener, screeners))
 
     # Jurisdictional risk (TI CPI + FATF)
     country_code = "IN" if (ticker.endswith(".NS") or ticker.endswith(".BO")) else ("US" if ticker and not "." in ticker else "IN")
@@ -908,5 +869,3 @@ def run_structured_aml_sweep(entity_name: str, ticker: str = "") -> list[dict[st
         logger.warning("Jurisdictional screening error: %s", exc)
 
     return [f.model_dump() for f in findings]
-
-

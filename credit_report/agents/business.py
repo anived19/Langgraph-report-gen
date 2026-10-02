@@ -6,7 +6,9 @@ reasons over what Finance and Hygiene already found (handed to it as
 context, not re-fetched) plus the rating rationale text when the entity has
 no ticker (reusing tools/rating_agency_tools.py, which caches, so this
 doesn't re-hit CRISIL for data Finance already pulled), with search_web_news
-as its only real tool for anything not already covered.
+as its only real tool for anything not already covered. When a CIN was
+supplied, the board and KMP from MCA records (Directors node) are handed in
+too — names, roles, dates and counts only, never DIN/PAN or PEP results.
 
 The LLM must tag each of the 4 dimensions grounded/inferred/unavailable
 rather than write one blended paragraph — completeness is then counted
@@ -16,15 +18,21 @@ the LLM's own claim, same discipline as Finance and Hygiene.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
-from langchain.agents import create_agent
-
-from credit_report.model import build_model
+from credit_report.agents.directors import board_context
+from credit_report.model import build_agent
 from credit_report.prompt_loader import load_prompt
-from credit_report.schemas import BusinessLLMAssessment, BusinessResult, _BUSINESS_DIMENSIONS
+from credit_report.schemas import BusinessDimensionFinding, BusinessLLMAssessment, BusinessResult, _BUSINESS_DIMENSIONS
 from credit_report.tool_capture import capturing
-from credit_report.trace import build_agent_trace
+from credit_report.validation import (
+    Attempt,
+    check_dimensions,
+    check_numbers_grounded,
+    check_summary,
+    evidence_from,
+    run_with_validation,
+)
 from tools.rating_agency_tools import get_rating_rationale
 from tools.search_tools import search_web_news
 
@@ -32,8 +40,7 @@ logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = load_prompt("business")
 
-# Named so tests can assert on it directly (tool-isolation check) — this
-# agent gets exactly search_web_news; rating-rationale fetching happens
+# This agent gets exactly search_web_news; rating-rationale fetching happens
 # deterministically below, not as an agent-invoked tool.
 _BASE_TOOLS = (search_web_news,)
 
@@ -51,6 +58,10 @@ def _build_context(state: dict[str, Any]) -> str:
     hygiene = state.get("hygiene_result") or {}
     if hygiene.get("summary"):
         parts.append(f"Hygiene/AML assessment (score {hygiene.get('raw_score')}/100): {hygiene['summary']}")
+
+    board = board_context(state.get("directors_result"))
+    if board:
+        parts.append(board)
 
     if not state.get("has_ticker"):
         entity_name = state.get("company_name") or state.get("company_reference", "")
@@ -86,35 +97,41 @@ def _compute_deterministic_stats(assessment: BusinessLLMAssessment) -> dict[str,
     }
 
 
+def validate_dimensions(attempt: Attempt, evidence_texts: list[str]) -> list[str]:
+    """Shared with the Banking agent: summary present, all four dimensions
+    filled and validly tagged, and every figure traceable to the context or
+    a search result."""
+    a = attempt.assessment
+    fields = {"summary": a.summary}
+    fields.update({f"{dim}.assessment": getattr(a, dim).assessment for dim in _BUSINESS_DIMENSIONS})
+    return (check_summary(a.summary)
+            + check_dimensions(a, _BUSINESS_DIMENSIONS)
+            + check_numbers_grounded(fields, evidence_from(attempt.captured, *evidence_texts, str(a.raw_score))))
+
+
 def run_business_agent(state: dict[str, Any]) -> dict[str, Any]:
     entity_name = state.get("company_name") or state.get("company_reference", "")
-
-    captured: list[dict[str, Any]] = []
-    tools = [capturing(fn, captured) for fn in _BASE_TOOLS]
-
-    agent = create_agent(
-        model=build_model(),
-        tools=tools,
-        system_prompt=_SYSTEM_PROMPT,
-        response_format=BusinessLLMAssessment,
-    )
 
     context = _build_context(state)
     user_msg = f"Entity: {entity_name}\n\nContext from other specialists:\n\n{context}"
 
-    issues: list[dict[str, Any]] = []
-    agent_result: dict[str, Any] | None = None
-    try:
-        agent_result = agent.invoke({"messages": [{"role": "user", "content": user_msg}]})
-        assessment: BusinessLLMAssessment = agent_result["structured_response"]
-    except Exception as exc:
-        logger.warning("Business agent failed for %r: %s", entity_name, exc)
-        issues.append({
-            "stage": "business_agent",
-            "message": f"Business agent run failed: {exc}",
-            "severity": "error",
-        })
-        from credit_report.schemas import BusinessDimensionFinding
+    def run_once(feedback: Optional[str]) -> Attempt:
+        captured: list[dict[str, Any]] = []
+        agent = build_agent([capturing(fn, captured) for fn in _BASE_TOOLS], _SYSTEM_PROMPT, BusinessLLMAssessment)
+        content = user_msg + (f"\n\n{feedback}" if feedback else "")
+        result: dict[str, Any] = {}
+        try:
+            result = agent.invoke({"messages": [{"role": "user", "content": content}]})
+            return Attempt(result["structured_response"], captured, result.get("messages", []))
+        except Exception as exc:
+            logger.warning("Business agent failed for %r: %s", entity_name, exc)
+            return Attempt(None, captured, result.get("messages", []), exc)
+
+    attempt, issues, traces = run_with_validation(
+        "business", entity_name, run_once, lambda a: validate_dimensions(a, [user_msg, _SYSTEM_PROMPT]),
+    )
+    assessment = attempt.assessment
+    if assessment is None:
         unavailable = BusinessDimensionFinding(assessment="unavailable", grounding="unavailable")
         assessment = BusinessLLMAssessment(
             raw_score=50,
@@ -125,7 +142,6 @@ def run_business_agent(state: dict[str, Any]) -> dict[str, Any]:
             industry_macro_headwinds=unavailable,
         )
 
-    trace = build_agent_trace("business", entity_name, (agent_result or {}).get("messages", []))
     stats = _compute_deterministic_stats(assessment)
 
     result = BusinessResult(
@@ -139,4 +155,4 @@ def run_business_agent(state: dict[str, Any]) -> dict[str, Any]:
         **stats,
     )
 
-    return {"business_result": result.model_dump(), "issues": issues, "traces": [trace]}
+    return {"business_result": result.model_dump(), "issues": issues, "traces": traces}

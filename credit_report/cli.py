@@ -4,13 +4,19 @@ CLI entry point for the credit-report pipeline.
 Usage:
     python -m credit_report.cli "HDFC Bank"
     python -m credit_report.cli "TCS.NS"
-    python -m credit_report.cli "JU Agri Sciences Private Limited"
+    python -m credit_report.cli "JU Agri Sciences Private Limited" --cin U74899DL1986PTC024176
+
+--cin is optional. With it the report adds a Directors section from MCA
+records (Probe42 via the Finoscale Data API — a paid call, cached 7 days)
+with a PEP screen per director, and watchlist hits can be confirmed against
+the company's identifiers.
 """
 from __future__ import annotations
 
 import argparse
 import logging
 import sys
+from typing import Optional
 
 from credit_report.graph import build_credit_report_graph
 from credit_report.reporting.pdf import compile_credit_report_pdf
@@ -21,12 +27,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("credit_report.cli")
 
 
-def generate_credit_report(company_reference: str) -> None:
-    print(f"\n> Credit report request: {company_reference}\n")
+def generate_credit_report(company_reference: str, cin: Optional[str] = None) -> None:
+    print(f"\n> Credit report request: {company_reference}" + (f" (CIN {cin})" if cin else "") + "\n")
 
     graph = build_credit_report_graph()
-    print("[1/2] Running Company Identity -> Finance / Hygiene / Business (+ Banking) -> Score Engine...")
-    result = graph.invoke({"company_reference": company_reference})
+    print("[1/2] Running Company Identity -> Directors -> Finance / Hygiene / Business (+ Banking) -> Score Engine...")
+    state: dict = {"company_reference": company_reference}
+    if cin:
+        state["cin"] = cin.strip().upper()
+    result = graph.invoke(state)
 
     report_dict = result["report"]
     print(
@@ -39,6 +48,8 @@ def generate_credit_report(company_reference: str) -> None:
     )
     if report_dict["issues"]:
         print(f"      -> {len(report_dict['issues'])} data-quality note(s) logged")
+    if report_dict["analyst_review"]:
+        print(f"      -> {len(report_dict['analyst_review'])} possible namesake(s) listed for analyst review (not scored)")
 
     print("[2/2] Rendering PDF...")
     report = CreditReport.model_validate(report_dict)
@@ -60,10 +71,15 @@ def main() -> None:
         type=str,
         help='Company reference, e.g. "HDFC Bank", "TCS.NS", "JU Agri Sciences Private Limited"',
     )
+    parser.add_argument(
+        "--cin",
+        default=None,
+        help="The company's CIN (optional) — adds directors from MCA records and a PEP screen per director",
+    )
     args = parser.parse_args()
 
     try:
-        generate_credit_report(args.query)
+        generate_credit_report(args.query, args.cin)
     except Exception:
         logger.exception("Credit report generation failed")
         sys.exit(1)
