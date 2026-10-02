@@ -55,13 +55,36 @@ def load_company_identity(state: dict[str, Any]) -> dict[str, Any]:
             "severity": "warning",
         })
 
-    return {
-        "company_name": best.get("name") or query,
-        "ticker": best.get("ticker"),
+    ticker = best.get("ticker")
+    name = best.get("name") or query
+    update = {
+        "company_name": name,
+        "ticker": ticker,
         "has_ticker": True,
         "resolution_confidence": best.get("confidence"),
         "issues": issues,
     }
+    # Watchlist screening is exact-name only, so it needs the full registered
+    # name ("Tata Consultancy Services Limited"), not the query ("TCS.NS",
+    # "HDFC Bank"). The Directors node overrides this with the MCA name when
+    # a CIN is supplied.
+    long_name = _listed_long_name(ticker)
+    if long_name:
+        update["legal_name"] = long_name
+        if not best.get("name") or name == ticker:
+            update["company_name"] = long_name
+    return update
+
+
+def _listed_long_name(ticker: str | None) -> str | None:
+    if not ticker:
+        return None
+    try:
+        import yfinance as yf
+        return (yf.Ticker(ticker).info or {}).get("longName") or None
+    except Exception as exc:
+        logger.info("Could not fetch the registered name for %s: %s", ticker, exc)
+        return None
 
 
 def classify_company(state: dict[str, Any]) -> dict[str, Any]:

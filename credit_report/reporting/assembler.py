@@ -2,8 +2,11 @@
 Report Synthesizer — deterministic, no LLM call happens at this stage.
 Every field in the assembled CreditReport is either copied straight from
 graph state or computed by a fixed rule (the score-threshold recommendation
-below). This mirrors the equity pipeline's own render_aml_markdown() /
-compile_pdf() split: agents reason, this stage only assembles and formats.
+below). Agents reason; this stage only assembles and formats.
+
+`analyst_review` gathers every possible namesake — exact-name watchlist
+records with no identifier (Hygiene) and exact-name PEP records for
+directors — into one list for the analyst. None of it is scored.
 """
 from __future__ import annotations
 
@@ -29,6 +32,16 @@ def _recommendation_for_score(final_score: float) -> tuple[str, str]:
     )
 
 
+def _analyst_review(state: dict[str, Any]) -> list[str]:
+    items = list((state.get("hygiene_result") or {}).get("analyst_review") or [])
+    for d in (state.get("directors_result") or {}).get("current", []):
+        pep = d.get("pep") or {}
+        if pep.get("status") == "analyst_review":
+            items.extend(f"PEP — director {d['name']}: {m} — analyst to confirm it is the same person; not scored."
+                         for m in pep.get("matches", []))
+    return list(dict.fromkeys(items))
+
+
 def assemble_credit_report(state: dict[str, Any]) -> dict[str, Any]:
     """
     Parent graph node: builds the final CreditReport from every specialist's
@@ -51,6 +64,8 @@ def assemble_credit_report(state: dict[str, Any]) -> dict[str, Any]:
         hygiene_result=state.get("hygiene_result") or {},
         business_result=state.get("business_result") or {},
         banking_result=state.get("banking_result"),
+        directors_result=state.get("directors_result"),
+        analyst_review=_analyst_review(state),
         recommendation=recommendation,
         recommendation_note=recommendation_note,
         issues=state.get("issues") or [],

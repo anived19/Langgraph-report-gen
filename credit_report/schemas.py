@@ -1,6 +1,5 @@
 """
-Pydantic schemas for the credit-report pipeline. Grows incrementally with
-each build phase (see plan) — only what Phase 0 needs lives here for now.
+Pydantic schemas for the credit-report pipeline.
 """
 from __future__ import annotations
 
@@ -57,6 +56,13 @@ class HygieneResult(BaseModel):
     sources_checked: int
     sources_unavailable: int
     completeness_ratio: float = Field(ge=0.0, le=1.0)
+    analyst_review: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Exact-name watchlist records with no identifier proving they are this entity — "
+            "for the analyst to rule out; never scored and never shown to the scoring LLM."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +195,41 @@ class BankingResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Directors (deterministic, no LLM) — credit_report/agents/directors.py.
+# Current directors / KMP from MCA records (Probe42 via the Finoscale Data
+# API) plus a PEP screen per person. Never scored: PEP sources carry no PAN
+# or DIN, so a name hit is for the analyst to rule on. DIN/PAN are kept
+# masked here and never reach an LLM prompt.
+# ---------------------------------------------------------------------------
+
+class DirectorProfile(BaseModel):
+    name: str
+    designation: Optional[str] = None
+    appointed_on: Optional[str] = None
+    tenure_years: Optional[float] = None
+    din_masked: Optional[str] = None
+    din_status: Optional[str] = None
+    other_directorships: int = Field(default=0, description="Other companies/LLPs where this person is currently on the board")
+    flagged_associations: list[str] = Field(
+        default_factory=list,
+        description="Linked companies/LLPs (current or past) under CIRP, struck off, dormant or in liquidation, from MCA records",
+    )
+    pep: dict[str, Any] = Field(default_factory=dict, description="tools/pep_tools.py:screen_person_pep result")
+
+
+class DirectorsResult(BaseModel):
+    status: str = Field(description="'ok' | 'not_available' | 'error'")
+    reason: Optional[str] = None
+    source: str = "MCA records (Probe42 via Finoscale Data API)"
+    legal_name: Optional[str] = None
+    current: list[DirectorProfile] = Field(default_factory=list)
+    ceased_last_24_months: list[dict[str, Any]] = Field(default_factory=list)
+    ceased_total: int = 0
+    pep_analyst_review: int = 0
+    pep_unscreened: int = 0
+
+
+# ---------------------------------------------------------------------------
 # Score Engine (Phase 5) — fully deterministic, no LLM. See
 # credit_report/scoring.py.
 # ---------------------------------------------------------------------------
@@ -232,6 +273,12 @@ class CreditReport(BaseModel):
     hygiene_result: dict[str, Any]
     business_result: dict[str, Any]
     banking_result: Optional[dict[str, Any]] = None
+    directors_result: Optional[dict[str, Any]] = None
+
+    analyst_review: list[str] = Field(
+        default_factory=list,
+        description="Possible namesakes on watchlists / PEP sources — listed for the analyst, never scored",
+    )
 
     recommendation: str = Field(description="'Recommended' | 'Recommended with Conditions' | 'Not Recommended' — fixed score thresholds, see reporting/assembler.py")
     recommendation_note: str

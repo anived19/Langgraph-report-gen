@@ -1,29 +1,37 @@
 """
-Finance specialist subgraph — ticker branch only (Phase 2). The no-ticker
-branch (rating-agency / GST-MCA fallback for private/unlisted companies) is
-built in Phase 2b; until then a company with no resolvable ticker gets an
-honest "not yet implemented" FinanceResult rather than a crash or a guess —
-consistent with the pipeline's never-fail rule.
+Finance specialist subgraph — two branches:
+
+- ticker: market and fundamental data from yfinance (tools/finance_tools.py).
+- no ticker (private/unlisted): a CRISIL rating rationale if one exists,
+  otherwise search_web_news.
 
 Same pattern as the Hygiene agent (credit_report/agents/hygiene.py): the LLM
 only produces a qualitative judgment (raw_score + summary); every tool call
 is captured via a closure so completeness is computed independently in plain
 Python, reusing tools/finance_tools.py:assemble_market_metrics()'s existing
 field-availability check rather than inventing a second definition of
-"expected data".
+"expected data". Each branch's output is checked in code
+(credit_report/validation.py) — required tools called, summary present,
+every figure traceable to a tool result or the rationale text — and the
+agent alone is rerun with the failures if it doesn't pass.
 """
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
-from langchain.agents import create_agent
-
-from credit_report.model import build_model
+from credit_report.model import build_agent
 from credit_report.prompt_loader import load_prompt
 from credit_report.schemas import FinanceLLMAssessment, FinanceResult
 from credit_report.tool_capture import capturing
-from credit_report.trace import build_agent_trace
+from credit_report.validation import (
+    Attempt,
+    check_numbers_grounded,
+    check_summary,
+    check_tools_called,
+    evidence_from,
+    run_with_validation,
+)
 from tools.finance_tools import (
     _MARKET_METRICS_FIELD_KEYS,
     assemble_market_metrics,
@@ -55,12 +63,10 @@ _COMPLETENESS_NO_DATA = 0.0
 
 # No-ticker branch gets only search_web_news — rating-rationale fetching is
 # deterministic (called directly below, not agent-invoked), so it isn't a
-# tool the LLM chooses to call. Named for the same tool-isolation testing
-# pattern as _BASE_TOOLS above.
+# tool the LLM chooses to call.
 _NO_TICKER_TOOLS = (search_web_news,)
 
-# Named so tests can assert on it directly (tool-isolation check) — this
-# agent gets exactly these tools and nothing from Hygiene/Business/Banking.
+# This agent gets exactly these tools and nothing from Hygiene/Business/Banking.
 _BASE_TOOLS = (
     get_price_snapshot,
     get_valuation_multiples,
@@ -70,6 +76,8 @@ _BASE_TOOLS = (
     get_ownership,
     compute_custom_financial_metric,
 )
+# The six data tools the finance prompt tells the agent to always call.
+_REQUIRED_TICKER_TOOLS = [fn.__name__ for fn in _BASE_TOOLS if fn is not compute_custom_financial_metric]
 
 # assemble_market_metrics() checks len(_MARKET_METRICS_FIELD_KEYS) fields plus
 # one more (quarterly_financials, checked separately) — see tools/finance_tools.py.
@@ -97,6 +105,22 @@ def _merge_ticker_tool_results(captured: list[dict[str, Any]]) -> dict[str, Any]
     return merged
 
 
+def _run_attempt(tools_fns, system_prompt: str, user_msg: str, entity_name: str):
+    """Returns a run_once(feedback) closure for run_with_validation."""
+    def run_once(feedback: Optional[str]) -> Attempt:
+        captured: list[dict[str, Any]] = []
+        agent = build_agent([capturing(fn, captured) for fn in tools_fns], system_prompt, FinanceLLMAssessment)
+        content = user_msg + (f"\n\n{feedback}" if feedback else "")
+        result: dict[str, Any] = {}
+        try:
+            result = agent.invoke({"messages": [{"role": "user", "content": content}]})
+            return Attempt(result["structured_response"], captured, result.get("messages", []))
+        except Exception as exc:
+            logger.warning("Finance agent failed for %r: %s", entity_name, exc)
+            return Attempt(None, captured, result.get("messages", []), exc)
+    return run_once
+
+
 def _run_no_ticker_finance(entity_name: str) -> dict[str, Any]:
     """
     No-ticker (private/unlisted company) Finance path. CRISIL rating
@@ -107,16 +131,6 @@ def _run_no_ticker_finance(entity_name: str) -> dict[str, Any]:
     """
     issues: list[dict[str, Any]] = []
     rationale = get_rating_rationale(entity_name)
-
-    captured_searches: list[dict[str, Any]] = []
-    tools = [capturing(fn, captured_searches) for fn in _NO_TICKER_TOOLS]
-
-    agent = create_agent(
-        model=build_model(),
-        tools=tools,
-        system_prompt=_NO_TICKER_SYSTEM_PROMPT,
-        response_format=FinanceLLMAssessment,
-    )
 
     if rationale["status"] == "ok":
         user_msg = (
@@ -136,23 +150,21 @@ def _run_no_ticker_finance(entity_name: str) -> dict[str, Any]:
             "severity": "info",
         })
 
-    agent_result: dict[str, Any] | None = None
-    try:
-        agent_result = agent.invoke({"messages": [{"role": "user", "content": user_msg}]})
-        assessment: FinanceLLMAssessment = agent_result["structured_response"]
-    except Exception as exc:
-        logger.warning("No-ticker Finance agent failed for %r: %s", entity_name, exc)
-        issues.append({
-            "stage": "finance_agent",
-            "message": f"Finance agent run failed: {exc}",
-            "severity": "error",
-        })
-        assessment = FinanceLLMAssessment(
-            raw_score=50,
-            summary="Finance assessment could not be completed this run due to an agent error.",
-        )
+    def validate(attempt: Attempt) -> list[str]:
+        a = attempt.assessment
+        return (check_summary(a.summary)
+                + check_numbers_grounded({"summary": a.summary},
+                                         evidence_from(attempt.captured, user_msg, _NO_TICKER_SYSTEM_PROMPT, str(a.raw_score))))
 
-    trace = build_agent_trace("finance", entity_name, (agent_result or {}).get("messages", []))
+    attempt, run_issues, traces = run_with_validation(
+        "finance", entity_name,
+        _run_attempt(_NO_TICKER_TOOLS, _NO_TICKER_SYSTEM_PROMPT, user_msg, entity_name), validate,
+    )
+    issues.extend(run_issues)
+    assessment = attempt.assessment or FinanceLLMAssessment(
+        raw_score=50,
+        summary="Finance assessment could not be completed this run due to an agent error.",
+    )
 
     # Tavily near-always returns *some* results for any query, even
     # irrelevant ones — a non-empty list isn't a meaningful "found
@@ -160,7 +172,7 @@ def _run_no_ticker_finance(entity_name: str) -> dict[str, Any]:
     # text, not just a non-empty results list.
     search_results_found = any(
         (r.get("content") or "").strip()
-        for call in captured_searches
+        for call in attempt.captured
         for r in (call.get("result") or [])
     )
 
@@ -199,7 +211,7 @@ def _run_no_ticker_finance(entity_name: str) -> dict[str, Any]:
         source_name=source_name,
         source_url=source_url,
     )
-    return {"finance_result": result.model_dump(), "issues": issues, "traces": [trace]}
+    return {"finance_result": result.model_dump(), "issues": issues, "traces": traces}
 
 
 def run_finance_agent(state: dict[str, Any]) -> dict[str, Any]:
@@ -209,42 +221,32 @@ def run_finance_agent(state: dict[str, Any]) -> dict[str, Any]:
     if not state.get("has_ticker") or not ticker:
         return _run_no_ticker_finance(entity_name)
 
-    captured: list[dict[str, Any]] = []
-    tools = [capturing(fn, captured) for fn in _BASE_TOOLS]
-
-    agent = create_agent(
-        model=build_model(),
-        tools=tools,
-        system_prompt=_SYSTEM_PROMPT,
-        response_format=FinanceLLMAssessment,
-    )
-
     user_msg = f"Entity: {entity_name} (ticker: {ticker})"
 
-    issues: list[dict[str, Any]] = []
-    agent_result: dict[str, Any] | None = None
-    try:
-        agent_result = agent.invoke({"messages": [{"role": "user", "content": user_msg}]})
-        assessment: FinanceLLMAssessment = agent_result["structured_response"]
-    except Exception as exc:
-        logger.warning("Finance agent failed for %r (%s): %s", entity_name, ticker, exc)
-        issues.append({
-            "stage": "finance_agent",
-            "message": f"Finance agent run failed: {exc}",
-            "severity": "error",
-        })
-        assessment = FinanceLLMAssessment(
-            raw_score=50,
-            summary="Finance assessment could not be completed this run due to an agent error.",
+    def validate(attempt: Attempt) -> list[str]:
+        a = attempt.assessment
+        failures = check_summary(a.summary) + check_tools_called(attempt.captured, _REQUIRED_TICKER_TOOLS)
+        failures += check_summary(a.six_month_outlook, "six_month_outlook")
+        failures += check_numbers_grounded(
+            {"summary": a.summary, "six_month_outlook": a.six_month_outlook},
+            evidence_from(attempt.captured, user_msg, _SYSTEM_PROMPT, str(a.raw_score)),
         )
+        return failures
 
-    trace = build_agent_trace("finance", entity_name, (agent_result or {}).get("messages", []))
-    merged = _merge_ticker_tool_results(captured)
+    attempt, issues, traces = run_with_validation(
+        "finance", entity_name, _run_attempt(_BASE_TOOLS, _SYSTEM_PROMPT, user_msg, entity_name), validate,
+    )
+    assessment = attempt.assessment or FinanceLLMAssessment(
+        raw_score=50,
+        summary="Finance assessment could not be completed this run due to an agent error.",
+    )
+
+    merged = _merge_ticker_tool_results(attempt.captured)
     metrics = assemble_market_metrics(ticker, merged)
     fetched_count = _EXPECTED_METRIC_COUNT - len(metrics.unavailable_fields)
     completeness_ratio = fetched_count / _EXPECTED_METRIC_COUNT if _EXPECTED_METRIC_COUNT else 0.0
 
-    if not captured:
+    if not attempt.captured:
         issues.append({
             "stage": "finance_agent",
             "message": "No Finance tools were actually called this run (agent may not have used them).",
@@ -264,4 +266,4 @@ def run_finance_agent(state: dict[str, Any]) -> dict[str, Any]:
         market_metrics=metrics.model_dump(mode="json"),
     )
 
-    return {"finance_result": finance_result.model_dump(), "issues": issues, "traces": [trace]}
+    return {"finance_result": finance_result.model_dump(), "issues": issues, "traces": traces}

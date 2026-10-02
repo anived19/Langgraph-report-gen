@@ -22,7 +22,6 @@ from typing import Any
 import yaml
 import yfinance as yf
 
-from schemas import TickerResolution
 
 logger = logging.getLogger(__name__)
 
@@ -272,18 +271,3 @@ def resolve_entity(query: str) -> list[dict[str, Any]]:
         candidates = _search_pass(raw_norm)
 
     return candidates
-
-
-def resolve_ticker(query: str) -> TickerResolution:
-    """Legacy helper returning TickerResolution for single-ticker waterfall compatibility."""
-    candidates = resolve_entity(query)
-    if not candidates:
-        return TickerResolution(query=query, resolved_ticker=None, confidence=0.0, method="unresolved")
-
-    first = candidates[0]
-    return TickerResolution(
-        query=query,
-        resolved_ticker=first["ticker"],
-        confidence=first.get("confidence", 0.7),
-        method="resolve_entity",
-    )

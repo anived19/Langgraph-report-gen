@@ -117,6 +117,33 @@
   </tr>
 </table>
 
+{% set dr = report.directors_result %}
+{% if dr %}
+<h2>Directors &amp; Key Managerial Personnel</h2>
+{% if dr.status == 'ok' %}
+<div class="source-note">Source: {{ dr.source }}{% if dr.legal_name %} — {{ dr.legal_name }}{% endif %}. Not scored: shown for the analyst. PEP checks cover MyNeta/ECI candidate affidavits and Wikidata office-holders, exact name only.</div>
+<table>
+  <tr><th>Name</th><th>Designation</th><th>Appointed</th><th>DIN</th><th>Other boards</th><th>Flags (MCA records)</th><th>PEP screen</th></tr>
+  {% for d in dr.current %}
+  <tr>
+    <td>{{ d.name }}</td>
+    <td>{{ d.designation or '—' }}</td>
+    <td>{{ d.appointed_on or '—' }}{% if d.tenure_years is not none %} ({{ d.tenure_years }} yrs){% endif %}</td>
+    <td>{{ d.din_masked or '—' }}{% if d.din_status and d.din_status|lower != 'approved' %}<br><strong>{{ d.din_status }}</strong>{% endif %}</td>
+    <td>{{ d.other_directorships }}</td>
+    <td>{% if d.flagged_associations %}{{ d.flagged_associations | join('; ') }}{% else %}none{% endif %}</td>
+    <td>{% if d.pep.status == 'no_match' %}no match{% elif d.pep.status == 'analyst_review' %}<strong>possible namesake — analyst review</strong>{% else %}unscreened{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% if dr.ceased_last_24_months %}
+<div class="source-note">Cessations in the last 24 months: {% for c in dr.ceased_last_24_months %}{{ c.name }} ({{ c.designation or 'director' }}, {{ c.ceased_on }}){% if not loop.last %}; {% endif %}{% endfor %}.</div>
+{% endif %}
+{% else %}
+<div class="source-note">Directors not available: {{ dr.reason }}</div>
+{% endif %}
+{% endif %}
+
 {% if report.is_bank and report.banking_result %}
 <h2>Banking</h2>
 <div class="summary-block">{{ report.banking_result.summary }}</div>
@@ -164,6 +191,16 @@
   <tr><th>High Severity</th><td>{{ report.hygiene_result.high_severity_count }}</td><th>Elevated Severity</th><td>{{ report.hygiene_result.elevated_severity_count }}</td></tr>
   <tr><th>Watch</th><td>{{ report.hygiene_result.watch_severity_count }}</td><th>Clean</th><td>{{ report.hygiene_result.none_severity_count }}</td></tr>
 </table>
+<div class="source-note">A watchlist record counts against the entity only when its name is exactly the entity's and it carries one of the entity's identifiers (CIN / PAN). Near names never match.</div>
+
+{% if report.analyst_review %}
+<h2>Analyst Review — Possible Namesakes (not scored)</h2>
+<ul class="issues-list">
+  {% for item in report.analyst_review %}
+  <li>{{ item }}</li>
+  {% endfor %}
+</ul>
+{% endif %}
 
 {% if report.issues %}
 <h2>Data Quality Notes</h2>
